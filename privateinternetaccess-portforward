@@ -1,0 +1,801 @@
+#!/usr/local/bin/php
+# SPDX-License-Identifier: MIT
+<?php
+
+const PATH_ETC = '/usr/local/etc/privateinternetaccess';
+const PATH_PFS = '/cf/conf/config.xml';
+
+class API
+{
+  // credentials
+  private $credentials;
+
+  // expiration
+  private $exp;
+
+  // api gateway
+  private $gateway;
+
+  // variables
+  private $vars;
+
+  public function __construct()
+  {
+    $this->credentials = new ArrayObject(
+      $this->get_credentials(),
+      ArrayObject::ARRAY_AS_PROPS
+    );
+
+    $this->exp = [
+      'token'     => null,
+      'signature' => null,
+      'port'      => null
+    ];
+
+    $this->vars = new ArrayObject(
+      [
+        'token'         => '',
+        'signature'     => '',
+        'port'          => ''
+      ],
+      ArrayObject::ARRAY_AS_PROPS
+    );
+
+    $this->gateway = Utils::resolve_gateway(19999);
+  }
+
+  public function bind_port()
+  {
+    list($host,) = explode(':', $this->gateway);
+
+    $data = [
+      'payload'   => base64_encode(
+        json_encode(
+          $this->vars->signature->payload
+        )
+      ),
+      'signature' => $this->vars->signature->signature,
+    ];
+
+    $r = Utils::curl(
+      [
+        CURLOPT_RESOLVE     => [
+          $this->gateway
+        ],
+        CURLOPT_URL         => sprintf(
+          'https://%s:19999/bindPort?%s',
+          $host,
+          http_build_query($data)
+        )
+      ]
+    );
+
+    $this->vars->port = json_decode($r);
+
+    // ports have to re-bind every 15min
+    // set to 10m, to ensure it hasn't expired
+    $this->exp['port'] = Utils::now()->modify('+10 minutes');
+  }
+
+  public function get_signature()
+  {
+    list($host,) = explode(':', $this->gateway);
+
+    $r = Utils::curl(
+      [
+        CURLOPT_RESOLVE     => [
+          $this->gateway
+        ],
+        CURLOPT_URL         => sprintf(
+          'https://%s:19999/getSignature?%s',
+          $host,
+          http_build_query(
+            [
+              'token' => $this->vars->token->token
+            ]
+          )
+        ),
+      ]
+    );
+
+    $this->vars->signature = json_decode($r);
+
+    $this->vars->signature->payload = json_decode(
+      base64_decode(
+        $this->vars->signature->payload
+      )
+    );
+
+    $this->exp['signature'] = DateTime::createFromFormat(
+      'Y-m-d\TH:i:s.u???Z',
+      $this->vars->signature->payload->expires_at
+    );
+  }
+
+  public function generate_token()
+  {
+    $r = Utils::curl(
+      [
+        CURLOPT_CAINFO  => PATH_ETC . '/cacert.pem',
+        CURLOPT_URL     => 'https://www.privateinternetaccess.com/gtoken/generateToken',
+        CURLOPT_USERPWD => sprintf(
+          '%s:%s',
+          $this->credentials->user,
+          $this->credentials->pass
+        ),
+      ]
+    );
+
+    $this->vars->token = json_decode($r);
+
+    assert(($this->vars->token->status === 'OK'));
+  }
+
+  public function get_port()
+  {
+    return intval($this->vars->signature->payload->port);
+  }
+
+  public function refresh()
+  {
+    foreach ($this->exp as $type => $exp) {
+      if (!$exp instanceof DateTime) {
+        continue;
+      }
+
+      if ($exp < Utils::now()) {
+        switch ($type) {
+          case 'token':
+            $this->generate_token();
+            break;
+          case 'signature':
+            $this->get_signature();
+            break;
+          case 'port':
+            $this->bind_port();
+            break;
+        }
+      }
+    }
+  }
+
+  private function get_credentials()
+  {
+    $if = constant('IF');
+
+    // initialize
+    list($user, $pass, $credentials) = ['', '', ''];
+
+    // openvpn interfaces
+    if (strpos($if, 'ovpnc') !== false) {
+      // find the config file for this interface
+      $ovpn_config = system(
+        "grep -H -r -s -l 'dev $if' /var/etc/openvpn"
+      );
+
+      $config_dir = dirname($ovpn_config);
+
+      // credentials are stored inside the "up" file
+      $cred_path = sprintf("%s/up", $config_dir);
+    }
+    // for everything else
+    else {
+      $cred_path = sprintf("%s/credentials", PATH_ETC);
+    }
+
+    $credentials = file_get_contents( $cred_path );
+
+    list($user, $pass,) = explode(PHP_EOL, $credentials);
+
+    return [
+      'user' => trim($user),
+      'pass' => trim($pass)
+    ];
+  }
+}
+
+class pfSense
+{
+  static $config;
+
+  static function conf_get_value(String $path, array $data)
+  {
+    // make sure we're loading the latest version
+    self::load_config();
+
+    $result = array();
+
+    foreach (self::$config->xpath($path) as $key) {
+      if ((string)$key->{$data['key']} != (string)$data['val']) {
+        continue;
+      }
+
+      $result[] = $key;
+    }
+
+    return $result;
+  }
+
+  static function conf_set_value(string $path, array $data)
+  {
+    // make sure we're loading the latest version
+    self::load_config();
+
+    foreach (self::$config->xpath($path) as $key) {
+      if ((string)$key->{$data['key']} != (string)$data['val']) {
+        continue;
+      }
+
+      foreach ($data['list'] as $k => $v) {
+        if (!isset($key->{$k})) {
+          $key->addChild($k, $v);
+        } else {
+          $key->{$k} = $v;
+        }
+      }
+    }
+
+    self::write_config();
+  }
+
+  static function reload_filters()
+  {
+    exec('/etc/rc.filter_configure');
+  }
+
+  private static function load_config()
+  {
+    self::$config = simplexml_load_file(PATH_PFS);
+  }
+
+  private static function write_config()
+  {
+    // Use DOMDocument as LIBXML_NOEMPTYTAG is not present in SimpleXML
+    $dom = new DOMDocument('1.0');
+
+    $dom_sxe = dom_import_simplexml(self::$config);
+
+    $dom_sxe = $dom->importNode($dom_sxe, true);
+    $dom_sxe = $dom->appendChild($dom_sxe);
+
+    file_put_contents(PATH_PFS, $dom->saveXML($dom, LIBXML_NOEMPTYTAG), LOCK_EX);
+  }
+}
+
+class AirDCPP
+{
+  // store config
+  private $config;
+
+  public function __construct($config)
+  {
+    $this->config = $config;
+  }
+
+  public function get_port()
+  {
+    $port = $this->config['port_type'] + "_type";
+
+    $data = [
+      "keys" => [ "$port" ],
+      "value_mode" => "current"
+    ];
+
+    $r = $this->curl('settings/get', $data);
+
+    if (!property_exists($r, $port)) {
+      return 0;
+    }
+
+    return $r->$port;
+ }
+
+  public function set_port(int $port)
+  {
+    switch ($this->config['port_type']) {
+      case 'tls':
+        $data = [
+          'tls_port' => $port
+        ];
+        break;
+      case 'tcp':
+        $data = [
+          'tcp_port' => $port,
+          'udp_port' => $port
+        ];
+        break;
+      default:
+        $data = [];
+        break;
+    }
+
+    $this->curl('settings/set', $data);
+  }
+
+  private function curl(String $path, array $post_data)
+  {
+    $hndl = curl_init();
+
+    $options = [
+      CURLOPT_HTTPHEADER      => [
+        "Accept: application/json",
+        "Content-Type: application/json"
+      ],
+      CURLOPT_POST            => true,
+      CURLOPT_POSTFIELDS      => json_encode($post_data),
+      CURLOPT_RETURNTRANSFER  => true,
+      CURLOPT_URL             => sprintf(
+        '%s/%s',
+        $this->config['url'],
+        $path
+      ),
+      CURLOPT_USERPWD         => sprintf(
+        '%s:%s',
+        $this->config['user'],
+        $this->config['pass']
+      ),
+      CURLOPT_VERBOSE         => false,
+    ];
+
+    curl_setopt_array($hndl, $options);
+
+    $r = curl_exec($hndl);
+
+    curl_close($hndl);
+
+    return json_decode($r);
+  }
+}
+
+class Deluge
+{
+  private $config;
+
+  public function __construct($config)
+  {
+    $this->config = $config;
+
+    $this->config['cookie_file'] = tempnam(
+      "/tmp", "privateinternetaccess-portforward-deluge-cookiejar-"
+    );
+  }
+
+  public function __destruct()
+  {
+    unlink($this->config['cookie_file']);
+  }
+
+  public function get_port()
+  {
+    // avoid checking cookie expiration, login every-time
+    $this->api_login();
+
+    $r = $this->curl(
+      [
+        'id'     => 1,
+        'method' => 'core.get_config',
+        'params' => [],
+      ]
+    );
+
+    if (is_array($r->result->listen_ports)) {
+      return array_pop($r->result->listen_ports);
+    } else {
+      return $r->result->listen_ports;
+    }
+  }
+
+  public function set_port($port)
+  {
+    // avoid checking cookie expiration, login every-time
+    $this->api_login();
+
+    $this->curl(
+      [
+        'id'     => 1,
+        'method' => 'core.set_config',
+        'params' => [
+          [
+            'listen_ports'   => [$port, $port],
+            'outgoing_ports' => [$port, $port],
+          ]
+        ],
+      ]
+    );
+  }
+
+  private function api_login()
+  {
+    $this->curl(
+      [
+        'id'     => 1,
+        'method' => 'auth.login',
+        'params' => [
+          $this->config['pass']
+        ],
+      ]
+    );
+  }
+
+  private function curl(array $post_data)
+  {
+    $hndl = curl_init();
+
+    curl_setopt_array(
+      $hndl,
+      [
+        CURLOPT_COOKIEFILE      => $this->config['cookie_file'],
+        CURLOPT_COOKIEJAR       => $this->config['cookie_file'],
+        CURLOPT_ENCODING        => 'gzip',
+        CURLOPT_HTTPHEADER      => [
+          "Accept: application/json",
+          "Content-Type: application/json"
+        ],
+        CURLOPT_POST            => true,
+        CURLOPT_POSTFIELDS      => json_encode($post_data),
+        CURLOPT_RETURNTRANSFER  => true,
+        CURLOPT_URL             => $this->config['url']
+      ]
+    );
+
+    $r = curl_exec($hndl);
+
+    curl_close($hndl);
+
+    return json_decode($r);
+  }
+}
+
+class External
+{
+  private $config;
+
+  public function __construct($config)
+  {
+    $this->config = $config;
+
+    if (!array_key_exists('script', $this->config)) {
+      echo ("Invalid external program setup. Please set an absolute path in portforward-settings.ini!");
+      exit(1);
+    }
+  }
+
+  public function get_port()
+  {
+    $port = system(
+      escapeshellcmd("$this->config['script'] get")
+    );
+
+    return intval($port);
+  }
+
+  public function set_port(int $port)
+  {
+    system(
+      escapeshellcmd("$this->config['script'] set ") . escapeshellarg("intval($port)")
+    );
+  }
+}
+
+class Client
+{
+  public $api;
+  public $app;
+
+  public $client;
+
+  public function __construct($settings)
+  {
+    $this->init_api();
+    $this->init_client($settings);
+  }
+
+  public function get_port()
+  {
+    $port = intval($this->api->get_port());
+
+    // workaround to avoid setting invalid port in a pfsense alias
+    if ($port < 1024 || $port > 65535) {
+      $port = 1024;
+    }
+
+    assert(Utils::is_in_range([$port, 1024, 65535]));
+
+    return $port;
+  }
+
+  public function is_port_outdated()
+  {
+    return ($this->app->get_port() != $this->api->get_port());
+  }
+
+  public function refresh()
+  {
+    $this->api->refresh();
+
+    if ($this->is_port_outdated()) {
+      $this->update_pf_alias();
+      $this->update_client_port();
+    }
+  }
+
+  public function update_client_port()
+  {
+    $this->app->set_port(
+      $this->get_port()
+    );
+  }
+
+  public function update_pf_alias()
+  {
+    pfSense::conf_set_value(
+      '/pfsense/aliases/alias',
+      [
+        'key' => 'name',
+        'val'  => $this->client['alias'],
+        'list' => [
+          'address'  => $this->get_port()
+        ]
+      ]
+    );
+
+    pfSense::reload_filters();
+  }
+
+  private function init_api()
+  {
+    $this->api = new API();
+
+    $this->api->generate_token();
+
+    $this->api->get_signature();
+
+    $this->api->bind_port();
+  }
+
+  private function init_client($client)
+  {
+    switch (strtolower($client['type'])) {
+      case 'airdcpp':
+        $this->app = new AirDCPP(
+          $client
+        );
+        break;
+      case 'deluge':
+        $this->app = new Deluge(
+          $client
+        );
+        break;
+      case 'external':
+        $this->app = new External(
+          $client
+        );
+        break;
+      default:
+        throw new Exception('Unknown Client');
+    }
+
+    $this->client = $client;
+  }
+}
+
+class Utils
+{
+  static function curl(array $options)
+  {
+    $defaults = [
+      CURLOPT_CAINFO          => PATH_ETC . '/ca.rsa.4096.crt',
+      CURLOPT_RETURNTRANSFER  => true,
+      CURLOPT_SSL_VERIFYPEER  => true,
+      CURLOPT_TIMEOUT         => 30,
+      CURLOPT_VERBOSE         => true
+    ];
+
+    $hndl = curl_init();
+
+    curl_setopt_array($hndl, $options + $defaults);
+
+    $response = curl_exec($hndl);
+
+    // retry if errors
+    $retry = 0;
+
+    while (in_array(curl_errno($hndl), [6, 7, 28]) && $retry < 3) {
+      $response = curl_exec($hndl);
+      $retry++;
+    }
+
+    curl_close($hndl);
+
+    return $response;
+  }
+
+  static function get_cn_from_tls_socket(String $addr, Int $port)
+  {
+    $stream_ctx = stream_context_create([
+      'ssl' => [
+        // populate the peer cert array
+        'capture_peer_cert' => true,
+        // don't verify, we don't have a CA
+        'verify_peer'       => false,
+        // don't verify, we don't know the CN
+        'verify_peer_name'  => false,
+      ]
+    ]);
+
+    $stream_client = stream_socket_client(
+      "ssl://" . $addr . ":$port",
+      $err_no,
+      $err_str,
+      30,
+      STREAM_CLIENT_CONNECT,
+      $stream_ctx
+    );
+
+    $stream_params = stream_context_get_params($stream_client);
+
+    $peer_cert = openssl_x509_parse($stream_params['options']['ssl']['peer_certificate']);
+
+    $cn = trim($peer_cert['subject']['CN']);
+
+    return $cn;
+  }
+
+  static function find_portforward_instances()
+  {
+    $if = constant('IF');
+
+    $pid = system(
+      sprintf(
+        "pgrep -f '%s -i %s'",
+        __FILE__,
+        $if
+      )
+    );
+
+    return intval($pid);
+  }
+
+  static function if_to_pif(String $if)
+  {
+    $pif = pfSense::conf_get_value(
+      '/pfsense/interfaces/*',
+      [
+        'key' => 'if',
+        'val' => $if
+      ]
+    );
+
+    $pif = reset($pif);
+
+    $ifs = $pif->xpath("parent::*");
+
+    $ifs = reset($ifs);
+
+    foreach ($ifs as $k => $v) {
+      if ((string)$v->if === $if) {
+        return $k;
+      }
+    }
+  }
+
+  static function insensitive_string_compare(String $str1, String $str2)
+  {
+    return (strtolower(trim((string)$str1)) === strtolower(trim((string)$str2)));
+  }
+
+  static function is_in_range(array $data)
+  {
+    list($val, $min, $max) = $data;
+
+    return filter_var(
+      $val,
+      FILTER_VALIDATE_INT,
+      [
+        'options' => [
+          'min_range' => $min,
+          'max_range' => $max
+        ]
+      ]
+    );
+  }
+
+  static function now()
+  {
+    return new DateTime('now');
+  }
+
+  static function resolve_gateway(Int $port)
+  {
+    $if = constant('IF');
+
+    $port = intval($port);
+
+    $gateway = pfSense::conf_get_value(
+      '/pfsense/gateways/gateway_item',
+      [
+        'key' => 'interface',
+        'val' => (string)Utils::if_to_pif($if)
+      ]
+    );
+
+    $gateway_item = reset($gateway);
+
+    $gateway = (string)$gateway_item->gateway;
+
+    // for everything dynamic, use netstat
+    if ($gateway == 'dynamic') {
+      $gateway = trim(
+        system("netstat -4 -rn | grep $if | grep -v '/' | awk '{print $1}'")
+      );
+    }
+
+    $common_name = '';
+
+    // retry until we get a result
+    while (empty($common_name)) {
+      $common_name = self::get_cn_from_tls_socket($gateway, $port);
+    }
+
+    return sprintf('%s:%d:%s', $common_name, $port, $gateway);
+  }
+}
+
+$options = getopt('i:k');
+
+if (!array_key_exists('i', $options) || empty($options['i'])) {
+  echo 'You need to specify an interface to process!' . PHP_EOL;
+  exit(1);
+}
+
+// interface
+define('IF', trim($options['i']));
+
+// stop running instances
+if (array_key_exists('k', $options)) {
+  posix_kill(
+    Utils::find_portforward_instances(),
+    9
+  );
+
+  exit(0);
+}
+
+$configs = parse_ini_file(PATH_ETC . '/portforward-settings.ini', true);
+
+$clients = array();
+
+foreach ($configs as $config) {
+  // not a client config
+  if (!is_array($config['client'])) {
+    continue;
+  }
+
+  // client has no assigned interface
+  if (!array_key_exists('if', $config['client'])) {
+    continue;
+  }
+
+  // client is not configured for this interface
+  if (!Utils::insensitive_string_compare($config['client']['if'], constant('IF'))) {
+    continue;
+  }
+
+  $clients[] = new Client($config['client']);
+}
+
+if (count($clients) < 1) {
+  // no clients are configured for this interface, bail
+  exit(0);
+}
+
+while (true) {
+  foreach ($clients as $client) {
+    $client->refresh();
+  }
+
+  sleep(
+    // primitive load-balancing
+    mt_rand(265, 285)
+  );
+}

@@ -1,0 +1,490 @@
+#!/usr/local/bin/php
+# SPDX-License-Identifier: MIT
+<?php
+
+const PATH_ETC = '/usr/local/etc/privateinternetaccess';
+const PATH_PFS = '/cf/conf/config.xml';
+
+class API
+{
+  //credentials
+  private $credentials;
+
+  // settings
+  private $settings;
+
+  // variables
+  public $vars;
+
+  public function __construct(array $settings)
+  {
+    $this->credentials = new ArrayObject(
+      $this->get_credentials(),
+      ArrayObject::ARRAY_AS_PROPS
+    );
+
+    $this->settings = new ArrayObject(
+      $settings,
+      ArrayObject::STD_PROP_LIST
+    );
+
+    $this->vars = new ArrayObject(
+      [
+        'token'     => '',
+        'tunnel'    => '',
+      ],
+      ArrayObject::ARRAY_AS_PROPS
+    );
+  }
+
+  public function add_key()
+  {
+    $resolve = Utils::resolve_cn($this->settings['region'], 1337);
+
+    list($host,) = explode(':', $resolve);
+
+    $r = Utils::curl(
+      [
+        CURLOPT_RESOLVE     => [
+          $resolve
+        ],
+        CURLOPT_URL         => sprintf(
+          'https://%s:1337/addKey?%s',
+          $host,
+          http_build_query([
+            'pt'     => $this->vars->token->token,
+            'pubkey' => $this->settings['publickey'],
+          ])
+        )
+      ]
+    );
+
+    $this->vars->tunnel = json_decode($r);
+
+    assert(($this->vars->tunnel->status === 'OK'));
+  }
+
+  public function generate_token()
+  {
+    $r = Utils::curl(
+      [
+        CURLOPT_CAINFO  => PATH_ETC . '/cacert.pem',
+        CURLOPT_URL     => 'https://www.privateinternetaccess.com/gtoken/generateToken',
+        CURLOPT_USERPWD => sprintf(
+          '%s:%s',
+          $this->credentials->user,
+          $this->credentials->pass
+        ),
+      ]
+    );
+
+    $this->vars->token = json_decode($r);
+
+    assert(($this->vars->token->status === 'OK'));
+  }
+
+  public function get_result(String $type)
+  {
+    switch ($type) {
+      case 'token':
+        $obj = $this->vars->token;
+        break;
+      case 'tunnel':
+        $obj = $this->vars->tunnel;
+        break;
+      default:
+        // yes its ugly, but it helps us avoid null-checks
+        $obj = new stdClass();
+    }
+
+    return $obj;
+  }
+
+  private function get_credentials()
+  {
+    $credentials = file_get_contents(
+      sprintf("%s/credentials", PATH_ETC)
+    );
+
+    list($user, $pass,) = explode(PHP_EOL, $credentials);
+
+    return [
+      'user' => trim($user),
+      'pass' => trim($pass)
+    ];
+  }
+}
+
+class pfSense
+{
+  static $config;
+
+  static function conf_get_value(String $path, array $data)
+  {
+    // make sure we're loading the latest version
+    self::load_config();
+
+    $result = array();
+
+    foreach (self::$config->xpath($path) as $key) {
+      if ((string)$key->{$data['key']} != (string)$data['val']) {
+        continue;
+      }
+
+      $result[] = $key;
+    }
+
+    return $result;
+  }
+
+  static function conf_set_value(string $path, array $data)
+  {
+    // make sure we're loading the latest version
+    self::load_config();
+
+    foreach (self::$config->xpath($path) as $key) {
+      if ((string)$key->{$data['key']} != (string)$data['val']) {
+        continue;
+      }
+
+      foreach ($data['list'] as $k => $v) {
+        if (!isset($key->{$k})) {
+          $key->addChild($k, $v);
+        } else {
+          $key->{$k} = $v;
+        }
+      }
+    }
+
+    self::write_config();
+  }
+
+  static function reload_filters()
+  {
+    exec('/etc/rc.filter_configure');
+  }
+
+  static function reload_interface(String $if)
+  {
+    exec('/etc/rc.interfaces_wan_configure ' . escapeshellarg($if));
+  }
+
+  private static function load_config()
+  {
+    self::$config = simplexml_load_file(PATH_PFS);
+  }
+
+  private static function write_config()
+  {
+    // Use DOMDocument as LIBXML_NOEMPTYTAG is not present in SimpleXML
+    $dom = new DOMDocument('1.0');
+
+    $dom_sxe = dom_import_simplexml(self::$config);
+
+    $dom_sxe = $dom->importNode($dom_sxe, true);
+    $dom_sxe = $dom->appendChild($dom_sxe);
+
+    file_put_contents(PATH_PFS, $dom->saveXML($dom, LIBXML_NOEMPTYTAG), LOCK_EX);
+  }
+}
+
+class Utils
+{
+  static function curl(array $options)
+  {
+    $defaults = [
+      CURLOPT_CAINFO          => PATH_ETC . '/ca.rsa.4096.crt',
+      CURLOPT_RETURNTRANSFER  => true,
+      CURLOPT_SSL_VERIFYPEER  => true,
+      CURLOPT_TIMEOUT         => 30,
+      CURLOPT_VERBOSE         => true
+    ];
+
+    $hndl = curl_init();
+
+    curl_setopt_array($hndl, $options + $defaults);
+
+    $response = curl_exec($hndl);
+
+    curl_close($hndl);
+
+    return $response;
+  }
+
+  static function find_v4_cidr_match(String $ip, String $gw)
+  {
+    //assert(filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4));
+    //assert(filter_var($gw, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4));
+
+    $ip_addr = sprintf("%032b", ip2long($ip));
+    $gw_addr = sprintf("%032b", ip2long($gw));
+
+    for ($i = 31; $i > 0; $i--) {
+      if (substr_compare($ip_addr, $gw_addr, 0, $i) === 0) {
+        return $i;
+      }
+    }
+  }
+
+  static function fetch_serverlist()
+  {
+    $r = Utils::curl(
+      [
+        CURLOPT_CAINFO  => PATH_ETC . '/cacert.pem',
+        CURLOPT_URL     => 'https://serverlist.piaservers.net/vpninfo/servers/v6'
+      ]
+    );
+
+    list($json,) = explode("\n", $r);
+
+    return json_decode($json);
+  }
+
+  static function if_to_pif(String $if)
+  {
+    $pif = pfSense::conf_get_value(
+      '/pfsense/interfaces/*',
+      [
+        'key' => 'if',
+        'val' => $if
+      ]
+    );
+
+    $pif = reset($pif);
+
+    $ifs = $pif->xpath("parent::*");
+
+    $ifs = reset($ifs);
+
+    foreach ($ifs as $k => $v) {
+      if ((string)$v->if === $if) {
+        return (string)$k;
+      }
+    }
+  }
+
+  static function is_in_range(array $data)
+  {
+    list($val, $min, $max) = $data;
+
+    return filter_var(
+      $val,
+      FILTER_VALIDATE_INT,
+      [
+        'options' => [
+          'min_range' => $min,
+          'max_range' => $max
+        ]
+      ]
+    );
+  }
+
+  static function is_ip_in_range(String $ip, String $gw, Int $mask)
+  {
+    if (!Utils::is_valid_ip($ip) || !Utils::is_valid_ip($gw)) {
+      return false;
+    }
+
+    if ($mask < 1 || $mask > 32) {
+      return false;
+    }
+
+    $bip = sprintf("%032b", ip2long($ip));
+    $bgw = sprintf("%032b", ip2long($gw));
+
+    return (substr_compare($bip, $bgw, 0, $mask) === 0);
+  }
+
+  static function is_tunnel_valid($tunnel)
+  {
+    // bail if invalid response
+    if (!property_exists($tunnel, 'peer_ip') || !property_exists($tunnel, 'server_vip')) {
+      return false;
+    }
+      
+    // check if the tunnel ip is valid
+    if (!Utils::is_valid_ip($tunnel->peer_ip)) {
+      printf(
+        'Invalid peer_ip: %s',
+        $tunnel->peer_ip,
+      );
+
+      return false;
+    }
+
+    // check if the tunnel gateway is valid
+    if (!Utils::is_valid_ip($tunnel->server_vip)) {
+      printf(
+        'Invalid gateway_ip: %s',
+        $tunnel->server_vip
+      );
+
+      return false;
+    }
+
+    // get all enabled interfaces
+    $interfaces = pfSense::conf_get_value(
+      '/pfsense/interfaces/*',
+      [
+        'key' => 'enable',
+        'val' => ''
+      ]
+    );
+
+    foreach ($interfaces as $if) {
+      // tunnel gateway
+      $tgw    = (string)$tunnel->server_vip;
+      // interface ip
+      $ifaddr = (string)$if->ipaddr;
+      // interface mask
+      $ifmask = (int)$if->subnet;
+
+      // check if the tunnel gateway overlaps with any
+      // networks on active interfaces
+      if (Utils::is_ip_in_range($tgw, $ifaddr, $ifmask)) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  static function is_valid_ip(String $ip)
+  {
+    return filter_var(trim($ip), FILTER_VALIDATE_IP);
+  }
+
+  static function now()
+  {
+    return new DateTime('now');
+  }
+
+  static function resolve_cn(String $region, Int $port)
+  {
+    $server_list = Utils::fetch_serverlist();
+
+    $selected_region = trim($region);
+
+    foreach ($server_list->regions as $region) {
+      if ($region->id != $selected_region) {
+        continue;
+      }
+
+      // primitive load-balancing
+      $wg_server = $region->servers->wg[array_rand($region->servers->wg)];
+
+      return sprintf('%s:%d:%s', $wg_server->cn, $port, $wg_server->ip);
+    }
+  }
+}
+
+$options = getopt('i:');
+
+if (!array_key_exists('i', $options) || empty($options['i'])) {
+  echo 'You need to specify an interface to process!';
+  exit(1);
+}
+
+// interface
+$if = trim($options['i']);
+
+// pfSense interface
+$pif = Utils::if_to_pif($if);
+
+$conf_tunnel = pfSense::conf_get_value(
+  '/pfsense/installedpackages/wireguard/tunnels/item',
+  [
+    'key' => 'name',
+    'val' => $if
+  ]
+);
+
+$conf_peer = pfSense::conf_get_value(
+  '/pfsense/installedpackages/wireguard/peers/item',
+  [
+    'key' => 'tun',
+    'val' => $if
+  ]
+);
+
+foreach ($conf_tunnel as $wg_tunnel) {
+  // skip any non-privateinternetaccess tunnels
+  if (strpos((string)$wg_tunnel->descr, 'PrivateInternetAccess') === false) {
+    continue;
+  }
+
+  foreach ($conf_peer as $wg_peer) {
+    // skip any non-active peers
+    if (strpos((string)$wg_peer->enabled, 'yes') === false) {
+      continue;
+    }
+
+    $api = new API([
+      'publickey' => (string)$wg_tunnel->publickey,
+      'region'    => (string)$wg_peer->descr,
+    ]);
+
+    $api->generate_token();
+
+    $api->add_key();
+
+    // validate the tunnel config
+    while (!Utils::is_tunnel_valid($api->get_result('tunnel'))) {
+      // avoid rate-limit
+      sleep(5);
+
+      // retry
+      $api->add_key();
+    }
+
+    // tunnel interface
+    pfSense::conf_set_value(
+      '/pfsense/interfaces/*',
+      [
+        'key' => 'if',
+        'val'  => $if,
+        'list' => [
+          'ipaddr' => $api->get_result('tunnel')->peer_ip,
+          'subnet' => Utils::find_v4_cidr_match(
+            $api->get_result('tunnel')->peer_ip,
+            $api->get_result('tunnel')->server_vip
+          )
+        ]
+      ]
+    );
+
+    // wireguard peer
+    pfSense::conf_set_value(
+      '/pfsense/installedpackages/wireguard/peers/item',
+      [
+        'key' => 'tun',
+        'val'  => $if,
+        'list' => [
+          'endpoint'  => $api->get_result('tunnel')->server_ip,
+          'port'      => $api->get_result('tunnel')->server_port,
+          'publickey' => $api->get_result('tunnel')->server_key,
+        ]
+      ]
+    );
+
+    // gateway update
+    pfSense::conf_set_value(
+      '/pfsense/gateways/gateway_item',
+      [
+        'key' => 'interface',
+        'val'  => $pif,
+        'list' => [
+          'gateway'   => $api->get_result('tunnel')->server_vip,
+        ]
+      ]
+    );
+
+    // reload the interface  
+    pfSense::reload_interface($pif);
+
+    // аnd filters
+    pfSense::reload_filters();
+
+    // in case of an address change
+  }
+}

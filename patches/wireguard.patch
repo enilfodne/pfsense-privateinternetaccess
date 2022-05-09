@@ -1,0 +1,12 @@
+--- /usr/local/pkg/wireguard/includes/wg.inc
++++ /usr/local/pkg/wireguard/includes/wg.inc
+@@ -780,6 +780,9 @@ function wg_tunnel_sync($tunnel_names, $restart_services = false, $resolve_endpo
+                // Sync each tunnel
+                foreach ((array) $tunnel_names as $tunnel_name) {
+ 
++                       // Run PrivateInternetAccess helper
++                       mwexec("/usr/local/bin/privateinternetaccess-wireguard -i $tunnel_name");
++
+                        // Attempt to sync the tunnel
+                        $tun_sync_status = wg_tunnel_sync_by_name($tunnel_name, false);
+ 
